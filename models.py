@@ -5,6 +5,8 @@ Uses a dual-import pattern so the module works both inside the Docker image
 """
 from __future__ import annotations
 
+from typing import Any, Dict
+
 from pydantic import Field
 
 try:
@@ -46,3 +48,9 @@ class SqlDebugObservation(Observation):
     last_action_error: str | None = None
     steps_taken: int = 0
     max_steps: int = 10
+    # Per-component grader output from the most recent step. Empty on reset.
+    # Lives on the observation directly (not inside ``metadata``) because
+    # openenv-core's serializer strips the ``metadata`` field from the HTTP
+    # response envelope. Exposing it here lets RL/agent code see exactly
+    # which component of the reward they lost and learn a targeted policy.
+    grader_breakdown: Dict[str, Any] = Field(default_factory=dict)

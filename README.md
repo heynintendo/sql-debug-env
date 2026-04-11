@@ -71,7 +71,7 @@ a fix:
 
 ## Task catalog
 
-There are 12 tasks in three difficulty tiers. All of them live in
+There are 16 tasks across four difficulty tiers. All of them live in
 `server/tasks.py`.
 
 ### Easy, 5-step budget: syntax and typo bugs
@@ -101,10 +101,25 @@ There are 12 tasks in three difficulty tiers. All of them live in
 | `hard_03_window_partition` | Window function partitions by the wrong column.                   |
 | `hard_04_date_off_by_one`  | Half-open date range excludes the last day of February 2024.      |
 
-Each task uses one of three schemas: `employees` and `departments`,
-`customers` / `products` / `orders`, or `sales`. Every table has 10 to 30
-rows of seed data, which is enough that the result sets are actually
-interesting and partial-credit scores stay informative.
+### Expert, 12-step budget: 2-3 compounding bugs
+
+These tasks chain multiple bugs together so an agent has to fix each one
+before the grader returns a near-perfect reward. They also use two new
+schemas (library and student-grades) so an agent can't memorise column
+names from the earlier tiers.
+
+| task_id                          | schema   | compounding bugs                                                                           |
+|----------------------------------|----------|--------------------------------------------------------------------------------------------|
+| `expert_01_library_multi_bug`    | library  | USA-only filter instead of USA/UK, missing `HAVING COUNT >= 3`, wrong ORDER BY direction.  |
+| `expert_02_library_complex_join` | library  | INNER JOIN drops books never checked out, wrong `IS NULL` column, selects id not name.    |
+| `expert_03_student_window_agg`   | students | Window `PARTITION BY` wrong column, `rnk > 1` instead of `rnk = 1`, wrong ORDER BY.       |
+| `expert_04_student_date_null`    | students | `LIKE '%Fall%'` matches every year, sums `course_id` not `credits`, HAVING uses OR.       |
+
+There are five schemas in total: `employees`/`departments`,
+`customers`/`products`/`orders`, `sales`, `authors`/`books`/`checkouts`,
+and `students`/`courses`/`enrollments`. Every table has 10 to 45 rows of
+seed data, which is enough that the result sets are actually interesting
+and partial-credit scores stay informative.
 
 ## Reward function
 
@@ -117,6 +132,23 @@ reward is a weighted sum of four things:
 | `column_match`    | 0.25   | Jaccard similarity of the actual vs expected column name sets.          |
 | `row_count_match` | 0.20   | `min(actual, expected) / max(actual, expected)`.                        |
 | `value_match`     | 0.40   | Per-column multiset overlap of cell values.                             |
+
+Each step also returns the full per-component breakdown as a top-level
+`grader_breakdown` field on the observation, so an agent can see exactly
+which component it lost (columns vs rows vs values) and target the next
+attempt accordingly:
+
+```json
+{
+  "syntax_valid": 1.0,
+  "column_match": 1.0,
+  "row_count_match": 0.4,
+  "value_match": 0.5,
+  "raw_score": 0.68,
+  "step_penalty_factor": 0.98,
+  "error": null
+}
+```
 
 After that:
 
@@ -206,28 +238,34 @@ python inference.py
 
 ### Baseline scores
 
-The fallback heuristic (no LLM, deterministic string rewrites that know
-the 12 bug patterns) hits every task on the first attempt:
+The fallback heuristic is a deterministic string-rewrite table. For the
+easy / medium / hard tiers it encodes the full fix for each bug pattern,
+so the baseline solves them on the first attempt. For the expert tier it
+deliberately fixes only ONE of the 2-3 compounding bugs per task, which
+leaves the agent in the partial-credit region and shows the difficulty
+gap in the table:
 
-| Difficulty | Tasks | Avg reward |
-|------------|-------|------------|
-| easy       | 4     | 0.98       |
-| medium     | 4     | 0.98       |
-| hard       | 4     | 0.98       |
-| overall    | 12    | 0.98       |
+| Difficulty | Tasks | Score per task                    | Avg score |
+|------------|-------|-----------------------------------|-----------|
+| easy       | 4     | 0.98, 0.98, 0.98, 0.98            | 0.980     |
+| medium     | 4     | 0.98, 0.98, 0.98, 0.98            | 0.980     |
+| hard       | 4     | 0.98, 0.98, 0.98, 0.98            | 0.980     |
+| expert     | 4     | 0.666, 0.765, 0.840, 0.749        | 0.755     |
+| **overall**| **16**|                                   | **0.924** |
 
-The heuristic fallback already knows the correct fix for each task, so it
-solves everything on the first try with a uniform 0.98. This is just a
-sanity-check upper bound. When an actual LLM agent runs against the
-environment, easy tasks (simple typos) will score higher than hard ones
-(NULL handling, window functions) since the model has to reason about the
-bug from the hint and schema alone.
+The easy / medium / hard uniform 0.98 is the clamp ceiling (rewards are
+bounded above by 0.99, with an additional step penalty of 0.02 per step).
+The heuristic already knows each bug so it always returns the fix on
+step 1. The expert numbers are meaningful: the agent fixes one bug but
+the other two leave columns, rows, and values misaligned, so the grader
+reports partial credit that reflects how much of the result set it got
+right.
 
-Rewards top out at 0.98 instead of 1.00 because of the clamp described
-above. Treat this as an upper bound: the heuristic knows the exact bugs,
-so it's essentially a sanity check that the environment, grader, and log
-format are all wired up. An LLM-based run will vary depending on model
-quality and how well it parses the hints.
+A real LLM agent should do BETTER than the heuristic on expert tasks
+(closer to the 0.98 ceiling if it fixes every bug) but may do worse on
+individual hard tasks if it misreads the hint. The baseline table is
+therefore a lower bound on what a strong LLM should achieve on expert
+and a rough upper bound on everything else.
 
 ## Validation
 

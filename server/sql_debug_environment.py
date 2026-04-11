@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -67,6 +67,11 @@ class _EpisodeState:
     last_query_result: str = ""
     last_is_error: bool = False
     last_error_msg: Optional[str] = None
+    # Component-level grader breakdown for the last step. Exposed in the
+    # observation's ``metadata`` field so agents can see exactly which part
+    # of the reward they lost and learn a more targeted policy. Empty dict
+    # on reset (no step has been graded yet).
+    last_breakdown: Dict[str, Any] = field(default_factory=dict)
 
 
 class SqlDebugEnvironment(Environment):
@@ -119,6 +124,11 @@ class SqlDebugEnvironment(Environment):
                 "steps_taken": ep.steps_taken,
                 "max_steps": ep.max_steps,
             },
+            # FIX 4: per-component grader output surfaced as a top-level
+            # observation field. openenv-core's serializer strips the
+            # ``metadata`` dict from the HTTP response, so the breakdown
+            # has to live here where it'll actually make it onto the wire.
+            grader_breakdown=dict(ep.last_breakdown),
             task_id=ep.task_id,
             difficulty=ep.difficulty,
             schema_sql=ep.schema_sql,
@@ -183,6 +193,7 @@ class SqlDebugEnvironment(Environment):
             last_query_result="",
             last_is_error=False,
             last_error_msg=None,
+            last_breakdown={},
         )
         return self._build_observation()
 
@@ -209,7 +220,7 @@ class SqlDebugEnvironment(Environment):
             ep.last_is_error = False
             ep.last_error_msg = None
 
-        reward, _breakdown = grade(
+        reward, breakdown = grade(
             query_error=err,
             actual_columns=cols or [],
             actual_rows=rows or [],
@@ -218,6 +229,7 @@ class SqlDebugEnvironment(Environment):
             steps_taken=ep.steps_taken,
         )
         ep.last_reward = _safe_reward(reward)
+        ep.last_breakdown = breakdown
 
         # An exact result-set match counts as a solve — even though the
         # emitted reward is clamped to SCORE_MAX (0.99) it's still the
@@ -242,7 +254,11 @@ class SqlDebugEnvironment(Environment):
                 "task_id": None,
                 "steps_taken": 0,
                 "done": False,
-                "last_reward": 0.0,
+                # Never emit exactly 0.0 anywhere — the Phase 2 validator
+                # treats it as a forbidden boundary value. Use SCORE_MIN even
+                # in the "no episode yet" fallback for consistency with the
+                # rest of the reward path.
+                "last_reward": SCORE_MIN,
             }
         ep = self._episode
         return {
