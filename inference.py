@@ -69,6 +69,41 @@ ENV_NAME = "sql-debug-env"
 MAX_ACTION_DISPLAY = 80
 HTTP_TIMEOUT = 30.0
 
+# ---------------------------------------------------------------------------
+# Reward clamping. The Phase 2 validator rejects any task score that is
+# exactly 0.0 or 1.0, so EVERY reward we ever emit — from the environment,
+# from a fallback path, from an exception handler, from the average — is
+# pushed through ``clamp_reward()``. The bounds here mirror the server-side
+# grader (0.01 / 0.99) so a clamp on either side is a no-op for well-behaved
+# responses and a safety net for anything that slips through.
+# ---------------------------------------------------------------------------
+
+REWARD_MIN = 0.01
+REWARD_MAX = 0.99
+FALLBACK_REWARD = REWARD_MIN  # used when we can't read a real reward
+
+
+def clamp_reward(value: Any) -> float:
+    """Coerce ``value`` to a float strictly inside (0, 1).
+
+    Accepts anything (None, str, numeric, NaN) and always returns a
+    finite float in [REWARD_MIN, REWARD_MAX]. This is the single choke
+    point through which every reward must pass before it's logged.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return FALLBACK_REWARD
+    # Guard against NaN / +/-inf: any comparison with NaN is False, so
+    # the min/max clamp below would leak NaN through. Handle explicitly.
+    if f != f or f in (float("inf"), float("-inf")):
+        return FALLBACK_REWARD
+    if f < REWARD_MIN:
+        return REWARD_MIN
+    if f > REWARD_MAX:
+        return REWARD_MAX
+    return f
+
 
 # ---------------------------------------------------------------------------
 # Logging — MUST match the spec exactly; no newlines inside a line, no extra
@@ -84,18 +119,25 @@ def log_start(task: str, env: str, model: str) -> None:
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    # Clamp defensively even though the caller should already be clamping.
+    # Having the guarantee right at the emission boundary means no code path
+    # anywhere in this file can print reward=0.00 or reward=1.00.
+    safe_reward = clamp_reward(reward)
     error_val = _one_line(error) if error else "null"
     truncated = action if len(action) <= MAX_ACTION_DISPLAY else action[: MAX_ACTION_DISPLAY - 3] + "..."
     truncated = _one_line(truncated)
     print(
-        f"[STEP] step={step} action={truncated} reward={reward:.2f} "
+        f"[STEP] step={step} action={truncated} reward={safe_reward:.2f} "
         f"done={str(done).lower()} error={error_val}",
         flush=True,
     )
 
 
 def log_end(success: bool, steps: int, rewards: List[float]) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    # Clamp every value in the list before rendering. Same reason as log_step:
+    # this is the last line of defence before the characters hit stdout.
+    safe_rewards = [clamp_reward(r) for r in rewards] or [FALLBACK_REWARD]
+    rewards_str = ",".join(f"{r:.2f}" for r in safe_rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
         flush=True,
@@ -340,14 +382,10 @@ def call_llm(obs: Dict[str, Any], prev_attempt: Optional[str], prev_feedback: Op
 
 
 # ---------------------------------------------------------------------------
-# Per-task episode runner.
+# Per-task episode runner. Every branch that touches a reward value pushes
+# it through ``clamp_reward()`` so nothing in the rewards list, the final
+# reward, or the [STEP] / [END] lines can ever equal 0.0 or 1.0.
 # ---------------------------------------------------------------------------
-
-# Fallback reward used only when a network error prevents the env from
-# producing a real reward. Must be strictly > 0 and < 1 (the validator
-# rejects exact 0.0 or 1.0).
-FALLBACK_REWARD = 0.01
-
 
 def run_task(task_id: str) -> float:
     log_start(task_id, ENV_NAME, MODEL_NAME)
@@ -363,23 +401,41 @@ def run_task(task_id: str) -> float:
         max_steps = int(obs.get("max_steps") or 10)
 
         while steps < max_steps:
-            query = call_llm(obs, last_query or None, last_feedback)
+            try:
+                query = call_llm(obs, last_query or None, last_feedback)
+            except Exception as e:  # defensive: never let call_llm escape
+                print(f"# LLM path raised: {e}", file=sys.stderr, flush=True)
+                query = heuristic_fallback(obs, last_feedback)
             if not query:
                 query = "SELECT 1;"
 
             try:
                 obs = env_step(query)
             except EnvHttpError:
-                # Record a non-zero fallback reward for this step so the
+                # Record a clamped fallback reward for this step so the
                 # rewards list stays non-empty and [END] is still valid.
                 steps += 1
-                rewards.append(FALLBACK_REWARD)
-                log_step(steps, query, FALLBACK_REWARD, False, "network error")
-                final_reward = FALLBACK_REWARD
+                fb = clamp_reward(FALLBACK_REWARD)
+                rewards.append(fb)
+                log_step(steps, query, fb, False, "network error")
+                final_reward = fb
+                break
+            except Exception as e:  # defensive: anything else that bubbles up
+                print(f"# step raised: {e}", file=sys.stderr, flush=True)
+                steps += 1
+                fb = clamp_reward(FALLBACK_REWARD)
+                rewards.append(fb)
+                log_step(steps, query, fb, False, f"step error: {e}")
+                final_reward = fb
                 break
 
             steps += 1
-            reward = float(obs.get("reward") or FALLBACK_REWARD)
+            # Clamp immediately on read. Do NOT use ``or FALLBACK_REWARD``:
+            # that would treat a legitimate 0.0 as missing. Go through an
+            # explicit None check, then through clamp_reward() which handles
+            # everything else (NaN, out-of-range, non-numeric, etc).
+            raw_reward = obs.get("reward")
+            reward = clamp_reward(FALLBACK_REWARD if raw_reward is None else raw_reward)
             done = bool(obs.get("done"))
             err = obs.get("last_action_error")
 
@@ -399,20 +455,21 @@ def run_task(task_id: str) -> float:
             if done:
                 break
 
-        # A reward at or near the clamp ceiling (0.99) means the grader saw
-        # an exact or near-exact match. Anything less counts as a failed
+        # A reward near the clamp ceiling (0.99) means the grader saw an
+        # exact or near-exact match. Anything less counts as a failed
         # episode for the success flag.
         success = final_reward >= 0.95
     except Exception as e:  # pragma: no cover - defensive
         print(f"# episode error: {e}", file=sys.stderr, flush=True)
-        if not rewards:
-            rewards.append(FALLBACK_REWARD)
     finally:
         if not rewards:
-            rewards = [FALLBACK_REWARD]
+            rewards = [clamp_reward(FALLBACK_REWARD)]
+        # log_end clamps each element again, but we also clamp here so the
+        # in-memory list is guaranteed-safe for any downstream consumer.
+        rewards = [clamp_reward(r) for r in rewards]
         log_end(success, steps, rewards)
 
-    return final_reward
+    return clamp_reward(final_reward)
 
 
 def main() -> int:
@@ -420,9 +477,9 @@ def main() -> int:
     task_ids = env_task_ids()
     scores: List[float] = []
     for tid in task_ids:
-        scores.append(run_task(tid))
+        scores.append(clamp_reward(run_task(tid)))
     if scores:
-        avg = sum(scores) / len(scores)
+        avg = clamp_reward(sum(scores) / len(scores))
         print(f"# average reward across {len(scores)} tasks: {avg:.3f}", flush=True)
     return 0
 
