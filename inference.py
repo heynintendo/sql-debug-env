@@ -76,7 +76,45 @@ ENV_BASE_URL = (
 
 ENV_NAME = "sql-debug-env"
 MAX_ACTION_DISPLAY = 80
-HTTP_TIMEOUT = 30.0
+
+# Tightened timeouts for Phase 2 validator (2 vCPU / 8GB / must complete
+# within the harness budget when running against a remote HF Space).
+HTTP_TIMEOUT = 10.0          # per network call to the env server
+LLM_TIMEOUT = 20.0           # per OpenAI chat completion
+PER_TASK_TIMEOUT = 60.0      # wall-clock per run_task() call
+
+# Hard cap on steps per episode regardless of what the env advertises.
+# The heuristic solves everything in 1 step; a real LLM with good
+# prompting should not need more than 3-5.
+HARD_MAX_STEPS = 5
+
+# Representative 15-task subset run by inference.py. The full 33-task
+# set is still discoverable via the /tasks endpoint and each task is
+# still graded the same way - this just caps how many episodes the
+# baseline agent runs in a single inference.py invocation so the
+# Phase 2 validator completes within its time budget.
+TASK_SUBSET = [
+    # 4 easy (all)
+    "easy_01_typo",
+    "easy_02_wrong_column",
+    "easy_03_string_quotes",
+    "easy_04_trailing_comma",
+    # 4 medium (all)
+    "medium_01_inner_vs_left_join",
+    "medium_02_missing_group_by",
+    "medium_03_wrong_order_direction",
+    "medium_04_or_vs_and",
+    # 3 hard (representative: null handling, count-skip, empty-string)
+    "hard_01_null_equality",
+    "hard_05_count_null_skip",
+    "hard_07_empty_string_null",
+    # 2 expert (multi-bug + null revenue leak)
+    "expert_01_library_multi_bug",
+    "expert_05_null_revenue_leak",
+    # 2 data-investigation (case mismatch + SYSTEM user)
+    "data_01_case_mismatch",
+    "data_04_negative_id",
+]
 
 # Defensive fallback reward when the server doesn't return a usable value.
 # Environment guarantees rewards in (0.01, 0.99); this is a safety net only.
@@ -202,14 +240,30 @@ def env_step(
 
 
 def env_task_ids() -> List[str]:
+    """Return the 15-task subset inference.py actually runs.
+
+    The full task catalogue (33 tasks) is still discoverable via the
+    /tasks endpoint - this function just filters to a representative
+    subset so the baseline completes within the Phase 2 validator's
+    time budget. The filtering is done against whichever task ids the
+    server actually reports, so we don't request tasks that don't
+    exist on the other side.
+    """
     try:
         r = _safe_request("GET", "/tasks")
         ids = r.json().get("task_ids")
         if ids:
-            return list(ids)
+            available = set(ids)
+            return [t for t in TASK_SUBSET if t in available]
     except EnvHttpError:
         pass
-    # Fallback mirrors server/tasks.py order.
+    # Fallback when /tasks is unreachable: return the subset directly.
+    return list(TASK_SUBSET)
+
+
+def _full_task_ids_fallback() -> List[str]:
+    """Full 33-task list, used only as a last-resort fallback when
+    neither /tasks nor TASK_SUBSET is available."""
     return [
         "easy_01_typo",
         "easy_02_wrong_column",
@@ -435,9 +489,24 @@ def call_llm(
     obs: Dict[str, Any],
     history: List[Dict[str, Any]],
 ) -> Dict[str, str]:
+    """Query the LLM for the next action, or fall back to the heuristic.
+
+    LLM calls have a hard ``LLM_TIMEOUT`` cap (20s). If the API is slow,
+    unavailable, or raises for any reason we immediately return the
+    deterministic heuristic so the per-task wall clock stays under
+    ``PER_TASK_TIMEOUT``.
+    """
     if OpenAI is None or not API_KEY:
         return heuristic_fallback(obs)
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
+    try:
+        client = OpenAI(
+            api_key=API_KEY,
+            base_url=API_BASE_URL,
+            timeout=LLM_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"# LLM client init failed: {e}", file=sys.stderr, flush=True)
+        return heuristic_fallback(obs)
     user_prompt = build_user_prompt(obs, history)
     try:
         resp = client.chat.completions.create(
@@ -448,6 +517,7 @@ def call_llm(
             ],
             temperature=0.0,
             max_tokens=768,
+            timeout=LLM_TIMEOUT,
         )
         text = resp.choices[0].message.content or ""
         parsed = parse_llm_action(text)
@@ -499,6 +569,14 @@ def _history_summary(action: Dict[str, str], obs: Dict[str, Any]) -> str:
 
 
 def run_task(task_id: str) -> float:
+    """Run one episode with a hard wall-clock budget.
+
+    Per-task budget = ``PER_TASK_TIMEOUT`` seconds (60). If the task
+    runs out of time we emit [END] with whatever rewards were collected
+    so far and return. Step count is capped at ``HARD_MAX_STEPS`` (5)
+    regardless of what the env advertises for this task's budget.
+    """
+    task_start = time.monotonic()
     log_start(task_id, ENV_NAME, MODEL_NAME)
     rewards: List[float] = []
     steps = 0
@@ -506,11 +584,24 @@ def run_task(task_id: str) -> float:
     final_reward = FALLBACK_REWARD
     history: List[Dict[str, Any]] = []
 
+    def _time_left() -> float:
+        return PER_TASK_TIMEOUT - (time.monotonic() - task_start)
+
     try:
         obs = env_reset(task_id)
-        max_steps = int(obs.get("max_steps") or 10)
+        # Hard cap on steps. The environment says 5-12 depending on
+        # task; we ignore that and use HARD_MAX_STEPS for every task.
+        env_max = int(obs.get("max_steps") or HARD_MAX_STEPS)
+        max_steps = min(HARD_MAX_STEPS, env_max)
 
         while steps < max_steps:
+            if _time_left() <= 0:
+                print(
+                    f"# per-task timeout reached for {task_id} after {steps} step(s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             try:
                 action = call_llm(obs, history)
             except Exception as e:
