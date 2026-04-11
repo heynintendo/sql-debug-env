@@ -216,6 +216,13 @@ the 12 bug patterns) hits every task on the first attempt:
 | hard       | 4     | 0.98       |
 | overall    | 12    | 0.98       |
 
+The heuristic fallback already knows the correct fix for each task, so it
+solves everything on the first try with a uniform 0.98. This is just a
+sanity-check upper bound. When an actual LLM agent runs against the
+environment, easy tasks (simple typos) will score higher than hard ones
+(NULL handling, window functions) since the model has to reason about the
+bug from the hint and schema alone.
+
 Rewards top out at 0.98 instead of 1.00 because of the clamp described
 above. Treat this as an upper bound: the heuristic knows the exact bugs,
 so it's essentially a sanity check that the environment, grader, and log
