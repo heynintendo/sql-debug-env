@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local env files
+.env
+.env.local
+
+# IMPORTANT: uv.lock MUST be committed so openenv validate passes
+# (Do NOT add uv.lock to this file.)

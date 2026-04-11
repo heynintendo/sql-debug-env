@@ -1,0 +1,12 @@
+spec_version: 1
+name: sql-debug-env
+version: "1.0.0"
+description: "SQL debugging environment — fix buggy queries against real SQLite databases with partial-credit rewards"
+type: environment
+runtime:
+  language: python
+  version: "3.12"
+app:
+  module: server.app
+  attr: app
+port: 7860

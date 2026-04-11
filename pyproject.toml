@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sql-debug-env"
+version = "1.0.0"
+description = "OpenEnv-compliant SQL debugging environment with partial-credit rewards"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "sql-debug-env contributors" }]
+dependencies = [
+    "openenv-core>=0.2.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+inference = [
+    "openai>=1.30",
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.setuptools]
+py-modules = ["models", "client"]
+
+[tool.setuptools.packages.find]
+include = ["server*"]
