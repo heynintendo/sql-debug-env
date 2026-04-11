@@ -8,14 +8,16 @@ STDOUT FORMAT — exactly these three line types per episode:
 
     [START] task=<task_id> env=<env_name> model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-    [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
+    [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...,rn>
 
 - reward / rewards are formatted to 2 decimal places.
+- score is formatted to 3 decimal places and is STRICTLY inside (0, 1) — the
+  Phase 2 validator rejects any task score that equals 0.0 or 1.0, so we
+  clamp into [0.01, 0.99] before printing.
 - done / success are lowercase booleans.
 - error is the raw last_action_error string, or the literal word ``null``
   (unquoted).
 - [END] is ALWAYS emitted, even on exception (try/finally).
-- [END] has NO ``score=`` field (the Phase 2 spec removed it).
 
 The script talks to a running server over HTTP. The default ``ENV_BASE_URL``
 points at the deployed HF Space, so the Phase 2 validator — which runs
@@ -138,8 +140,16 @@ def log_end(success: bool, steps: int, rewards: List[float]) -> None:
     # this is the last line of defence before the characters hit stdout.
     safe_rewards = [clamp_reward(r) for r in rewards] or [FALLBACK_REWARD]
     rewards_str = ",".join(f"{r:.2f}" for r in safe_rewards)
+    # Per-task "score" is the best reward the agent achieved on this task,
+    # clamped one more time into (0, 1) so it can never be exactly 0.0 or
+    # 1.0. The Phase 2 validator reads this field and rejects boundary
+    # values. We use max(rewards) so a task that the agent solved on any
+    # attempt reflects that success, and a task that only ever errored out
+    # still gets the 0.01 floor.
+    score = clamp_reward(max(safe_rewards) if safe_rewards else FALLBACK_REWARD)
     print(
-        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.3f} rewards={rewards_str}",
         flush=True,
     )
 

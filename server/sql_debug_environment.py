@@ -24,11 +24,29 @@ except ImportError:  # local dev without openenv-core installed
         pass
 
 try:
-    from .grader import SCORE_MIN, format_result, grade
+    from .grader import SCORE_MAX, SCORE_MIN, clamp_score, format_result, grade
     from .tasks import TASKS, get_task, list_task_ids
 except ImportError:  # when run as top-level module inside Docker
-    from grader import SCORE_MIN, format_result, grade  # type: ignore
+    from grader import SCORE_MAX, SCORE_MIN, clamp_score, format_result, grade  # type: ignore
     from tasks import TASKS, get_task, list_task_ids  # type: ignore
+
+
+def _safe_reward(value: Any) -> float:
+    """Coerce any value into a clamped reward in [SCORE_MIN, SCORE_MAX].
+
+    This is the single choke point every observation reward passes through
+    before being serialized to the wire. Handles None, non-numeric, NaN,
+    +/-inf, and out-of-range values by falling back to SCORE_MIN. The Phase
+    2 validator rejects exact 0.0 or 1.0 anywhere in the response, so we
+    refuse to emit them from this function.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return SCORE_MIN
+    if f != f or f in (float("inf"), float("-inf")):
+        return SCORE_MIN
+    return clamp_score(f)
 
 
 @dataclass
@@ -86,9 +104,15 @@ class SqlDebugEnvironment(Environment):
     def _build_observation(self) -> SqlDebugObservation:
         ep = self._episode
         assert ep is not None
+        # Double-clamp on the way out. ep.last_reward is already clamped in
+        # step(), but routing every outgoing observation through _safe_reward
+        # means the serializer can NEVER see None, NaN, 0.0, or 1.0 on the
+        # reward field even if a future edit introduces a bug upstream.
+        safe_reward = _safe_reward(ep.last_reward)
+        ep.last_reward = safe_reward
         return SqlDebugObservation(
             done=ep.done,
-            reward=ep.last_reward,
+            reward=safe_reward,
             metadata={
                 "task_id": ep.task_id,
                 "difficulty": ep.difficulty,
@@ -193,7 +217,7 @@ class SqlDebugEnvironment(Environment):
             expected_rows=ep.expected_rows,
             steps_taken=ep.steps_taken,
         )
-        ep.last_reward = reward
+        ep.last_reward = _safe_reward(reward)
 
         # An exact result-set match counts as a solve — even though the
         # emitted reward is clamped to SCORE_MAX (0.99) it's still the
