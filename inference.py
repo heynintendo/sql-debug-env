@@ -45,6 +45,15 @@ try:
 except Exception:
     OpenAI = None  # type: ignore
 
+# Shared envelope flatten helper (used by the client.py module too).
+# Import is optional - if utils.py isn't on the path we fall back to a
+# local definition so inference.py still runs in isolation.
+try:
+    from utils import flatten_response as _flatten_external
+    _HAS_UTILS = True
+except Exception:  # pragma: no cover
+    _HAS_UTILS = False
+
 
 # ---------------------------------------------------------------------------
 # Required env-var plumbing.
@@ -134,7 +143,10 @@ class EnvHttpError(RuntimeError):
 
 def _flatten(data: Dict[str, Any]) -> Dict[str, Any]:
     """Merge openenv-core's ``{observation, reward, done}`` envelope into a
-    single flat dict."""
+    single flat dict. Delegates to ``utils.flatten_response`` when
+    available; otherwise uses a local fallback."""
+    if _HAS_UTILS:
+        return _flatten_external(data)
     obs = data.get("observation")
     if not isinstance(obs, dict):
         return data
@@ -213,6 +225,10 @@ def env_task_ids() -> List[str]:
         "hard_04_date_off_by_one",
         "hard_05_count_null_skip",
         "hard_06_self_join_double_count",
+        "hard_07_empty_string_null",
+        "hard_08_case_inconsistent_status",
+        "hard_09_duplicate_user_product",
+        "hard_10_integer_division",
         "expert_01_library_multi_bug",
         "expert_02_library_complex_join",
         "expert_03_student_window_agg",
@@ -221,6 +237,8 @@ def env_task_ids() -> List[str]:
         "expert_06_window_running_total",
         "expert_07_top_per_group",
         "expert_08_cte_progress_tracking",
+        "expert_09_cents_vs_dollars",
+        "expert_10_implicit_cross_join",
     ]
 
 
@@ -363,8 +381,22 @@ def heuristic_fallback(obs: Dict[str, Any]) -> Dict[str, str]:
         ("COUNT(p.discharge_date)", "COUNT(DISTINCT t.patient_id)"),
         # hard_06: <> -> <
         ("te1.member_id <> te2.member_id", "te1.member_id < te2.member_id"),
+        # hard_07 empty_string_null: add "OR discharge_date = ''" branch
+        (
+            "WHERE discharge_date IS NULL ORDER BY admission_date",
+            "WHERE discharge_date IS NULL OR discharge_date = '' ORDER BY admission_date",
+        ),
+        # hard_08 case_inconsistent_status: LOWER()
+        ("WHERE status = 'active'", "WHERE LOWER(status) = 'active'"),
+        # hard_09 duplicate_user_product: add DISTINCT
+        ("COUNT(user_id) AS unique_buyers", "COUNT(DISTINCT user_id) AS unique_buyers"),
+        # hard_10 integer_division: replace SUM/COUNT with AVG*1.0
+        ("SUM(c.credits) / COUNT(c.credits)", "ROUND(AVG(c.credits * 1.0), 2)"),
     ]
-    # expert partial fixes: fix exactly ONE of the 2-3 bugs per task
+    # expert partial fixes: fix exactly ONE of the 2-3 bugs per task.
+    # expert_09 and expert_10 get NO entries - they require exploration
+    # and the heuristic shouldn't "solve" them by lookup, landing them in
+    # the low-partial-credit region to show real difficulty on the table.
     partial_fixes = [
         ("ORDER BY avg_price ASC", "ORDER BY avg_price DESC"),
         ("INNER JOIN checkouts", "LEFT JOIN checkouts"),

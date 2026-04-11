@@ -93,8 +93,13 @@ class SqlDebugObservation(Observation):
     last_action_error: str | None = None
     steps_taken: int = 0
     max_steps: int = 10
+    # Check actions are limited per episode to prevent the agent from
+    # binary-searching the hidden oracle. This field tracks how many
+    # check actions remain in the current episode.
+    checks_remaining: int = 2
     # Per-component grader output from the most recent fix action. Empty
     # on reset and on non-fix actions. Contains ``syntax_valid``,
     # ``column_match``, ``row_count_match``, ``value_match``,
-    # ``order_match``, ``raw_score``, ``step_penalty_factor``, ``error``.
+    # ``order_match``, ``raw_score``, ``step_penalty_factor``,
+    # ``weights``, ``error``.
     grader_breakdown: Dict[str, Any] = Field(default_factory=dict)

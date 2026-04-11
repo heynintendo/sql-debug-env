@@ -11,6 +11,18 @@ from typing import Any, Dict, Optional
 from .models import SqlDebugAction, SqlDebugObservation
 
 try:
+    # Shared envelope helper. Fall back to a local definition if utils.py
+    # isn't importable (e.g. when this file is copied without siblings).
+    from .utils import flatten_response as _flatten_external  # type: ignore
+    _HAS_UTILS = True
+except Exception:  # pragma: no cover
+    try:
+        from utils import flatten_response as _flatten_external  # type: ignore
+        _HAS_UTILS = True
+    except Exception:
+        _HAS_UTILS = False
+
+try:
     from openenv.core.client import EnvClient  # type: ignore
 
     _HAS_OPENENV = True
@@ -35,9 +47,10 @@ class SqlDebugEnv(EnvClient):
     @staticmethod
     def _flatten(data: Dict[str, Any]) -> Dict[str, Any]:
         """Merge an openenv-core ``{observation, reward, done}`` envelope
-        into a single flat dict for our Pydantic ``SqlDebugObservation``.
-        Handles both the openenv-core shape and the local fallback shape.
-        """
+        into a single flat dict. Delegates to ``utils.flatten_response``
+        when available; otherwise uses a local fallback."""
+        if _HAS_UTILS:
+            return _flatten_external(data)
         obs = data.get("observation")
         if not isinstance(obs, dict):
             return data

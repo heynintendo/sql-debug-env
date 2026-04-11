@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r /app/server/requirements.txt
 # Bring in the source. models.py lives at the repo root and is imported
 # from both the root package and server.* via the dual-import pattern.
 COPY models.py /app/models.py
+COPY utils.py /app/utils.py
 COPY server/ /app/server/
 COPY openenv.yaml /app/openenv.yaml
 COPY README.md /app/README.md

@@ -1,26 +1,24 @@
 """SQL Debug Environment - OpenEnv-compliant environment class.
 
 Each episode presents one buggy SQL query over a freshly-built in-memory
-SQLite database. The agent interacts with the environment through five
-action types:
+SQLite database. The agent interacts via five action types:
 
-    fix        - submit a corrected query for grading
-    check      - test a query against the hidden expected output and get
-                 a pass/fail summary (never reveals the actual expected rows)
-    describe   - inspect a table's structure via PRAGMA table_info
+    fix        - submit a corrected query for grading (only graded action)
+    check      - test a query against the hidden oracle (pass/fail summary
+                 only). LIMITED to CHECK_LIMIT uses per episode to prevent
+                 binary-search reverse-engineering of the expected output.
+    describe   - inspect a table's structure (PRAGMA table_info + COUNT)
     diagnostic - run a read-only SELECT to investigate the data
     explain    - get EXPLAIN QUERY PLAN for a query
 
-Only ``fix`` actions get graded. The other four all cost a step and return
-a flat information reward (``INFO_REWARD`` = 0.02). This is the same step
-budget as a fix attempt, so an agent can't infinitely spam diagnostics.
-Episodes end when a fix produces the exact gold result set or when
-``steps_taken`` hits ``max_steps``.
+Info-gathering actions return differentiated rewards based on how
+productive they tend to be: describe/diagnostic 0.03, explain 0.02,
+check (FAIL) 0.03, check (PASS) 0.05. All inside (0.01, 0.99).
 
-The agent NEVER sees the gold expected_output. Fix or check actions
-return a pass/fail summary against the hidden answer. This is the key
-change vs the previous iteration of the environment, which leaked the
-gold output and collapsed the debugging task into reverse-engineering.
+The database is built ONCE per episode and persisted across actions.
+Write operations are rejected in fix/diagnostic/explain to keep the
+shared DB clean. This is much faster than rebuilding the 200-500 row
+tables on every action.
 """
 from __future__ import annotations
 
@@ -49,21 +47,45 @@ except ImportError:
     from tasks import TASKS, get_task, list_task_ids  # type: ignore
 
 
-# Reward for information-gathering actions (describe/diagnostic/explain/check).
-# Must be strictly inside (0, 1). Acts as a floor that distinguishes an
-# info action from an error (0.05) or a near-perfect fix (~0.98).
-INFO_REWARD = 0.02
-# Max rows shown by the diagnostic action (to keep the observation tidy).
-DIAGNOSTIC_MAX_ROWS = 20
-# Keywords that disqualify a diagnostic query - we only allow read-only
-# SELECT statements. The check happens on the first non-whitespace token
-# so comments before a CTE are fine.
-DIAGNOSTIC_FORBIDDEN = {
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+
+# Info action rewards (differentiated by usefulness, all in (0.01, 0.99))
+REWARD_DESCRIBE = 0.03
+REWARD_DIAGNOSTIC = 0.03
+REWARD_EXPLAIN = 0.02
+REWARD_CHECK_FAIL = 0.03
+REWARD_CHECK_PASS = 0.05
+
+# Max rows shown by a diagnostic action
+DIAGNOSTIC_MAX_ROWS = 50
+
+# Maximum number of check actions per episode. Prevents an agent from
+# binary-searching the hidden oracle by hammering /step with different
+# candidate queries.
+CHECK_LIMIT = 2
+
+# Keywords that are forbidden in fix and diagnostic actions. This keeps
+# the shared per-episode database clean and prevents an agent from
+# corrupting state between steps.
+WRITE_FORBIDDEN = {
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
     "REPLACE", "TRUNCATE", "ATTACH", "DETACH", "PRAGMA",
     "VACUUM", "REINDEX", "ANALYZE",
 }
 VALID_ACTION_TYPES = {"fix", "check", "describe", "diagnostic", "explain"}
+
+
+def _first_keyword(query: str) -> str:
+    """Extract the first SQL keyword after any leading comments/whitespace."""
+    if not query:
+        return ""
+    q = re.sub(r"/\*.*?\*/", " ", query, flags=re.DOTALL)
+    q = re.sub(r"--[^\n]*", " ", q)
+    q = q.strip()
+    m = re.match(r"(\w+)", q)
+    return m.group(1).upper() if m else ""
 
 
 @dataclass
@@ -80,7 +102,12 @@ class _EpisodeState:
     buggy_query: str
     correct_query: str
     hint: str
-    # last-action feedback fields
+    # Persistent DB connection. One per episode, reused across actions.
+    # Writes are rejected in fix/diagnostic/explain so this stays clean.
+    db_conn: Optional[sqlite3.Connection] = None
+    # Per-episode counters
+    checks_used: int = 0
+    # Last action feedback fields
     last_query_result: str = ""
     last_check_result: str = ""
     last_diagnostic_result: str = ""
@@ -88,18 +115,6 @@ class _EpisodeState:
     last_is_error: bool = False
     last_error_msg: Optional[str] = None
     last_breakdown: Dict[str, Any] = field(default_factory=dict)
-
-
-def _first_keyword(query: str) -> str:
-    """Extract the first SQL keyword after any leading comments/whitespace."""
-    if not query:
-        return ""
-    # Strip /* ... */ and -- ... line comments
-    q = re.sub(r"/\*.*?\*/", " ", query, flags=re.DOTALL)
-    q = re.sub(r"--[^\n]*", " ", q)
-    q = q.strip()
-    m = re.match(r"(\w+)", q)
-    return m.group(1).upper() if m else ""
 
 
 class SqlDebugEnvironment(Environment):
@@ -110,30 +125,21 @@ class SqlDebugEnvironment(Environment):
         self._episode: Optional[_EpisodeState] = None
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Query execution helpers
     # ------------------------------------------------------------------
-
-    def _fresh_conn(self) -> sqlite3.Connection:
-        """Build a fresh :memory: SQLite database pre-seeded with the
-        current task's schema. Every action rebuilds this - since our
-        supported actions are read-only (we reject writes in diagnostic),
-        there's no state to preserve between actions within an episode,
-        and rebuilding is simpler than cloning a connection."""
-        assert self._episode is not None
-        con = sqlite3.connect(":memory:")
-        con.executescript(self._episode.schema_sql)
-        return con
 
     def _run_query(
         self, query: str
     ) -> Tuple[Optional[List[str]], Optional[List[Tuple]], Optional[str]]:
-        """Execute ``query`` against a fresh DB for the current task.
+        """Execute ``query`` against the PERSISTENT per-episode DB.
 
         Returns (columns, rows, error). On error, columns and rows are
         None and error is the exception message.
         """
         assert self._episode is not None
-        con = self._fresh_conn()
+        con = self._episode.db_conn
+        if con is None:
+            return None, None, "EnvironmentError: database not initialized"
         try:
             cur = con.execute(query)
             rows = cur.fetchall()
@@ -141,17 +147,34 @@ class SqlDebugEnvironment(Environment):
             return cols, rows, None
         except Exception as e:
             return None, None, f"{type(e).__name__}: {e}"
-        finally:
-            con.close()
 
     # ------------------------------------------------------------------
     # Action handlers
     # ------------------------------------------------------------------
 
     def _handle_fix(self, query: str) -> None:
-        """Grade a fix attempt against the hidden gold answer."""
         ep = self._episode
         assert ep is not None
+
+        # Reject write statements so the persistent DB stays clean.
+        first = _first_keyword(query)
+        if first in WRITE_FORBIDDEN:
+            err = f"fix queries must be read-only SELECT; '{first}' is not allowed"
+            ep.last_query_result = f"ERROR: {err}"
+            ep.last_is_error = True
+            ep.last_error_msg = err
+            ep.last_reward = clamp_score(0.05)
+            ep.last_breakdown = {
+                "syntax_valid": 0.0,
+                "column_match": 0.0,
+                "row_count_match": 0.0,
+                "value_match": 0.0,
+                "order_match": 0.0,
+                "raw_score": 0.05,
+                "step_penalty_factor": 1.0,
+                "error": err,
+            }
+            return
 
         cols, rows, err = self._run_query(query)
 
@@ -161,7 +184,10 @@ class SqlDebugEnvironment(Environment):
             ep.last_error_msg = err
         else:
             assert cols is not None and rows is not None
-            ep.last_query_result = format_result(cols, rows)
+            preview_rows = list(rows[:DIAGNOSTIC_MAX_ROWS])
+            ep.last_query_result = format_result(cols, preview_rows)
+            if len(rows) > DIAGNOSTIC_MAX_ROWS:
+                ep.last_query_result += f"\n(... {len(rows) - DIAGNOSTIC_MAX_ROWS} more rows truncated)"
             ep.last_is_error = False
             ep.last_error_msg = None
 
@@ -173,6 +199,7 @@ class SqlDebugEnvironment(Environment):
             expected_rows=ep.expected_rows,
             steps_taken=ep.steps_taken,
             correct_query=ep.correct_query,
+            difficulty=ep.difficulty,
         )
         ep.last_reward = clamp_score(reward)
         ep.last_breakdown = breakdown
@@ -188,14 +215,30 @@ class SqlDebugEnvironment(Environment):
             ep.done = True
 
     def _handle_check(self, query: str) -> None:
-        """Test a query and return a pass/fail summary without revealing
-        the actual expected rows."""
         ep = self._episode
         assert ep is not None
+
+        # Enforce check limit to prevent binary-search exploit.
+        if ep.checks_used >= CHECK_LIMIT:
+            ep.last_check_result = (
+                f"Check limit reached ({CHECK_LIMIT} per episode). "
+                "Use 'fix' to submit your answer or 'diagnostic' to "
+                "investigate further."
+            )
+            ep.last_reward = clamp_score(REWARD_CHECK_FAIL)
+            ep.last_breakdown = {
+                "action_type": "check",
+                "info_only": True,
+                "check_limit_reached": True,
+            }
+            return
+
+        ep.checks_used += 1
 
         cols, rows, err = self._run_query(query)
         if err is not None:
             ep.last_check_result = f"FAIL: query errored: {err}"
+            ep.last_reward = clamp_score(REWARD_CHECK_FAIL)
         else:
             assert cols is not None and rows is not None
             n_actual = len(rows)
@@ -205,19 +248,24 @@ class SqlDebugEnvironment(Environment):
                     f"FAIL: column mismatch. Got {len(cols)} column(s), "
                     f"expected {len(ep.expected_columns)}."
                 )
+                ep.last_reward = clamp_score(REWARD_CHECK_FAIL)
             elif n_actual != n_expected:
                 ep.last_check_result = (
                     f"FAIL: row count mismatch. Got {n_actual} row(s), "
                     f"expected {n_expected}."
                 )
+                ep.last_reward = clamp_score(REWARD_CHECK_FAIL)
             elif list(rows) == list(ep.expected_rows):
                 ep.last_check_result = (
                     f"PASS: all {n_actual} row(s) match the expected output "
                     "exactly."
                 )
+                ep.last_reward = clamp_score(REWARD_CHECK_PASS)
             else:
-                # Same shape, but content differs. Count how many rows
-                # appear at the right position.
+                # Same shape, different content. Report positional match
+                # count only (not WHICH rows match). This is informative
+                # enough to guide an iterating agent but not enough to
+                # binary-search the expected output.
                 matching = sum(
                     1 for i, r in enumerate(rows)
                     if i < len(ep.expected_rows) and tuple(r) == tuple(ep.expected_rows[i])
@@ -226,26 +274,28 @@ class SqlDebugEnvironment(Environment):
                     f"FAIL: same shape but content differs. "
                     f"{matching} of {n_actual} row(s) match at the correct position."
                 )
-        ep.last_reward = clamp_score(INFO_REWARD)
-        ep.last_breakdown = {"action_type": "check", "info_only": True}
+                ep.last_reward = clamp_score(REWARD_CHECK_FAIL)
+        ep.last_breakdown = {
+            "action_type": "check",
+            "info_only": True,
+            "checks_used": ep.checks_used,
+            "checks_remaining": CHECK_LIMIT - ep.checks_used,
+        }
 
     def _handle_describe(self, table_name: str) -> None:
-        """Describe a table's schema via PRAGMA table_info + COUNT(*)."""
         ep = self._episode
         assert ep is not None
         if not table_name:
             ep.last_diagnostic_result = "ERROR: describe action requires 'table_name'."
             ep.last_is_error = True
             ep.last_error_msg = "missing table_name"
-            ep.last_reward = clamp_score(INFO_REWARD)
+            ep.last_reward = clamp_score(REWARD_DESCRIBE)
             ep.last_breakdown = {"action_type": "describe", "info_only": True}
             return
 
-        con = self._fresh_conn()
+        con = ep.db_conn
         try:
-            rows = con.execute(
-                f"PRAGMA table_info({table_name})"
-            ).fetchall()
+            rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
             if not rows:
                 ep.last_diagnostic_result = (
                     f"ERROR: table '{table_name}' not found in this database."
@@ -267,7 +317,7 @@ class SqlDebugEnvironment(Environment):
                     if notnull:
                         flags.append("NOT NULL")
                     flag_str = "  " + " ".join(flags) if flags else ""
-                    lines.append(f"  {name:<16s} {ctype:<10s}{flag_str}")
+                    lines.append(f"  {name:<18s} {ctype:<10s}{flag_str}")
                 ep.last_diagnostic_result = "\n".join(lines)
                 ep.last_is_error = False
                 ep.last_error_msg = None
@@ -275,32 +325,29 @@ class SqlDebugEnvironment(Environment):
             ep.last_diagnostic_result = f"ERROR: {type(e).__name__}: {e}"
             ep.last_is_error = True
             ep.last_error_msg = str(e)
-        finally:
-            con.close()
-        ep.last_reward = clamp_score(INFO_REWARD)
+        ep.last_reward = clamp_score(REWARD_DESCRIBE)
         ep.last_breakdown = {"action_type": "describe", "info_only": True}
 
     def _handle_diagnostic(self, query: str) -> None:
-        """Run a read-only SELECT to investigate the data."""
         ep = self._episode
         assert ep is not None
         if not query.strip():
             ep.last_diagnostic_result = "ERROR: diagnostic action requires a query."
             ep.last_is_error = True
             ep.last_error_msg = "missing query"
-            ep.last_reward = clamp_score(INFO_REWARD)
+            ep.last_reward = clamp_score(REWARD_DIAGNOSTIC)
             ep.last_breakdown = {"action_type": "diagnostic", "info_only": True}
             return
 
         first = _first_keyword(query)
-        if first in DIAGNOSTIC_FORBIDDEN:
+        if first in WRITE_FORBIDDEN:
             ep.last_diagnostic_result = (
                 f"ERROR: diagnostic queries must be read-only SELECT statements. "
                 f"'{first}' is not allowed."
             )
             ep.last_is_error = True
             ep.last_error_msg = f"forbidden keyword: {first}"
-            ep.last_reward = clamp_score(INFO_REWARD)
+            ep.last_reward = clamp_score(REWARD_DIAGNOSTIC)
             ep.last_breakdown = {"action_type": "diagnostic", "info_only": True}
             return
 
@@ -318,22 +365,33 @@ class SqlDebugEnvironment(Environment):
             ep.last_diagnostic_result = body
             ep.last_is_error = False
             ep.last_error_msg = None
-        ep.last_reward = clamp_score(INFO_REWARD)
+        ep.last_reward = clamp_score(REWARD_DIAGNOSTIC)
         ep.last_breakdown = {"action_type": "diagnostic", "info_only": True}
 
     def _handle_explain(self, query: str) -> None:
-        """Run EXPLAIN QUERY PLAN on the given query."""
         ep = self._episode
         assert ep is not None
         if not query.strip():
             ep.last_diagnostic_result = "ERROR: explain action requires a query."
             ep.last_is_error = True
             ep.last_error_msg = "missing query"
-            ep.last_reward = clamp_score(INFO_REWARD)
+            ep.last_reward = clamp_score(REWARD_EXPLAIN)
             ep.last_breakdown = {"action_type": "explain", "info_only": True}
             return
 
-        con = self._fresh_conn()
+        first = _first_keyword(query)
+        if first in WRITE_FORBIDDEN:
+            ep.last_diagnostic_result = (
+                f"ERROR: explain only supports read-only SELECT queries. "
+                f"'{first}' is not allowed."
+            )
+            ep.last_is_error = True
+            ep.last_error_msg = f"forbidden keyword: {first}"
+            ep.last_reward = clamp_score(REWARD_EXPLAIN)
+            ep.last_breakdown = {"action_type": "explain", "info_only": True}
+            return
+
+        con = ep.db_conn
         try:
             rows = con.execute(f"EXPLAIN QUERY PLAN {query}").fetchall()
             lines = ["Query plan:"]
@@ -346,9 +404,7 @@ class SqlDebugEnvironment(Environment):
             ep.last_diagnostic_result = f"ERROR: {type(e).__name__}: {e}"
             ep.last_is_error = True
             ep.last_error_msg = str(e)
-        finally:
-            con.close()
-        ep.last_reward = clamp_score(INFO_REWARD)
+        ep.last_reward = clamp_score(REWARD_EXPLAIN)
         ep.last_breakdown = {"action_type": "explain", "info_only": True}
 
     # ------------------------------------------------------------------
@@ -358,9 +414,6 @@ class SqlDebugEnvironment(Environment):
     def _build_observation(self) -> SqlDebugObservation:
         ep = self._episode
         assert ep is not None
-        # Reward is already clamped at the grader boundary. This is a
-        # defensive assignment to make the value explicit; trust the
-        # grader, don't re-clamp.
         return SqlDebugObservation(
             done=ep.done,
             reward=ep.last_reward,
@@ -369,13 +422,14 @@ class SqlDebugEnvironment(Environment):
                 "difficulty": ep.difficulty,
                 "steps_taken": ep.steps_taken,
                 "max_steps": ep.max_steps,
+                "checks_used": ep.checks_used,
+                "checks_remaining": CHECK_LIMIT - ep.checks_used,
             },
             task_id=ep.task_id,
             difficulty=ep.difficulty,
             schema_sql=ep.schema_sql,
             buggy_query=ep.buggy_query,
-            # NOTE: expected_output is NOT exposed to the agent. The
-            # grader uses ep.expected_columns/rows internally.
+            # NOTE: expected_output is NOT exposed to the agent.
             hint=ep.hint,
             query_result=ep.last_query_result,
             check_result=ep.last_check_result,
@@ -385,6 +439,7 @@ class SqlDebugEnvironment(Environment):
             last_action_error=ep.last_error_msg,
             steps_taken=ep.steps_taken,
             max_steps=ep.max_steps,
+            checks_remaining=max(0, CHECK_LIMIT - ep.checks_used),
             grader_breakdown=dict(ep.last_breakdown),
         )
 
@@ -398,22 +453,37 @@ class SqlDebugEnvironment(Environment):
         seed: Optional[int] = None,
         **_: Any,
     ) -> SqlDebugObservation:
-        """Start a new episode."""
+        """Start a new episode.
+
+        Builds the SQLite database ONCE and stores the connection on
+        the episode state. Subsequent actions in the same episode reuse
+        this connection, which is much faster than rebuilding 200-500
+        row tables on every step.
+        """
         if seed is not None:
             self._rng = random.Random(seed)
 
         task = self._rng.choice(TASKS) if task_id is None else get_task(task_id)
 
-        # Precompute the gold result set for grading. This is the only
-        # place we actually evaluate the correct_query.
+        # Close the previous episode's DB if we have one.
+        if self._episode is not None and self._episode.db_conn is not None:
+            try:
+                self._episode.db_conn.close()
+            except Exception:
+                pass
+
+        # Build the persistent per-episode database.
         con = sqlite3.connect(":memory:")
+        con.executescript(task["schema_sql"])
         try:
-            con.executescript(task["schema_sql"])
             cur = con.execute(task["correct_query"])
             exp_rows = cur.fetchall()
             exp_cols = [d[0] for d in cur.description] if cur.description else []
-        finally:
+        except Exception as e:
+            # If the gold query is broken, surface that loudly. Shouldn't
+            # happen in practice - all tasks are verified at build time.
             con.close()
+            raise RuntimeError(f"gold query failed for {task['task_id']}: {e}")
 
         self._episode = _EpisodeState(
             task_id=task["task_id"],
@@ -428,6 +498,8 @@ class SqlDebugEnvironment(Environment):
             buggy_query=task["buggy_query"],
             correct_query=task["correct_query"],
             hint=task["hint"],
+            db_conn=con,
+            checks_used=0,
             last_query_result="",
             last_check_result="",
             last_diagnostic_result="",
@@ -443,7 +515,6 @@ class SqlDebugEnvironment(Environment):
             raise RuntimeError("step() called before reset()")
         ep = self._episode
         if ep.done:
-            # No-op once done; return floor reward.
             ep.last_reward = SCORE_MIN
             return self._build_observation()
 
@@ -451,8 +522,7 @@ class SqlDebugEnvironment(Environment):
         action_type = (getattr(action, "action_type", None) or "fix").lower()
         ep.last_action_type = action_type
 
-        # Clear previous per-action output so each step's observation
-        # only reflects the most recent action.
+        # Clear previous per-action fields.
         ep.last_query_result = ""
         ep.last_check_result = ""
         ep.last_diagnostic_result = ""
@@ -480,7 +550,7 @@ class SqlDebugEnvironment(Environment):
             )
             ep.last_is_error = True
             ep.last_error_msg = f"unknown action_type: {action_type}"
-            ep.last_reward = clamp_score(INFO_REWARD)
+            ep.last_reward = clamp_score(REWARD_DIAGNOSTIC)
             ep.last_breakdown = {"action_type": action_type, "info_only": True}
 
         if ep.steps_taken >= ep.max_steps:
@@ -506,10 +576,8 @@ class SqlDebugEnvironment(Environment):
         }
 
     def close(self) -> None:
-        # No-op: openenv-core HTTP handlers call close() in a finally
-        # block after every request. Clearing state here would break
-        # the HTTP REST flow when a singleton factory reuses the instance
-        # across reset -> step.
+        # No-op to avoid breaking the HTTP REST singleton-factory flow.
+        # The per-episode DB connection is closed on the next reset().
         pass
 
     @staticmethod
