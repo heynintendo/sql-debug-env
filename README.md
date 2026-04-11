@@ -23,6 +23,12 @@ five-verb action language to investigate the data, check candidate
 fixes against a hidden oracle (limited to 2 uses per episode), and
 eventually submit a corrected query for grading.
 
+The environment has **33 tasks**, including a set of five
+"data-investigation" tasks where the bug is IN THE DATA rather than in
+the SQL. These tasks cannot be solved by reading the query alone - the
+agent must use the ``diagnostic`` action to inspect the table
+contents and discover the inconsistency.
+
 The agent does NOT see the gold expected output. It reasons about what
 the query should produce from the schema, the data, and the hint, then
 fixes the query. Several tasks require actual data exploration to
@@ -107,7 +113,9 @@ the schema, the hint, and its own `check`/`diagnostic` actions.
 
 ## Task catalog
 
-28 tasks across four difficulty tiers and eight schemas.
+33 tasks across four difficulty tiers, eight schemas, and one
+"data-investigation" subset where the bug is hidden in the data
+rather than in the SQL.
 
 ### Easy (max 5 steps): syntax and typo bugs
 
@@ -163,6 +171,24 @@ Reading the schema and the buggy query is not enough.
 | `expert_08_cte_progress_tracking` | projects  | Missing billable filter in CTE, missing GROUP BY in milestone CTE, missing status filter.        |
 | `expert_09_cents_vs_dollars`      | ecommerce | `amount` column stores cents, not dollars. `WHERE amount > 100` matches almost everything. Only diagnosable by `diagnostic: SELECT amount FROM purchases LIMIT 10`. |
 | `expert_10_implicit_cross_join`   | projects  | Comma-join missing join condition creates a cartesian product. Totals are inflated. Only obvious when you compare raw row counts. |
+
+### Data investigation (5 tasks): the bug is in the data, not the query
+
+These 5 tasks present a query that is syntactically and logically
+correct. The bug is that the underlying data contains unexpected
+values: mixed-case strings, trailing whitespace, cancelled zero-hour
+entries, a SYSTEM placeholder user with a negative id, mixed
+ISO/unix timestamp formats. An LLM that reads only the query cannot
+diagnose any of these - it has to run `diagnostic` actions against
+the real data to find the inconsistency.
+
+| task_id                         | schema    | bug in the data                                                                |
+|---------------------------------|-----------|--------------------------------------------------------------------------------|
+| `data_01_case_mismatch`         | ecommerce | Some users have `country='usa'` or `'Usa'` alongside `'USA'`. Exact-match filter misses them. |
+| `data_02_trailing_whitespace`   | hospital  | Some doctors have `specialty='Cardiology '` (trailing space). `WHERE = 'Cardiology'` skips them. |
+| `data_03_zero_vs_null`          | projects  | Cancelled time entries have `hours=0.0`. Naive `HAVING COUNT(*) > 0` admits members who did zero real work. |
+| `data_04_negative_id`           | ecommerce | A `SYSTEM` placeholder user with `user_id=-1` holds 60 anonymous purchases and tops the "most orders" ranking. |
+| `data_05_unix_timestamp`        | ecommerce | ~20 `purchase_time` values are stored as unix timestamp strings (`'1704153600'`). Lexicographic `>= '2024-01-01'` excludes them because `'1' < '2'`. |
 
 ### Schemas
 
@@ -319,13 +345,28 @@ For the 8 expert tasks (plus the 2 exploration-heavy experts
 fixes at most 1 of the 2-3 compounding bugs. The resulting spread
 from the live Space:
 
-| Difficulty | Tasks | Score per task                                                                                    | Avg    |
-|------------|-------|---------------------------------------------------------------------------------------------------|--------|
-| easy       | 4     | 0.98 / 0.98 / 0.98 / 0.98                                                                         | 0.980  |
-| medium     | 4     | 0.98 / 0.98 / 0.98 / 0.98                                                                         | 0.980  |
-| hard       | 10    | 0.98 x 10                                                                                         | 0.980  |
-| expert     | 10    | 0.500 / 0.545 / 0.617 / 0.634 / 0.549 / 0.441 / 0.150 / 0.354 / 0.921 / 0.490                     | 0.524  |
-| overall    | 28    |                                                                                                   | 0.816  |
+| Difficulty        | Tasks | Score per task                                                                          | Avg    |
+|-------------------|-------|------------------------------------------------------------------------------------------|--------|
+| easy              | 4     | 0.98 / 0.98 / 0.98 / 0.98                                                               | 0.980  |
+| medium            | 4     | 0.98 / 0.98 / 0.98 / 0.98                                                               | 0.980  |
+| hard              | 10    | 0.98 x 10                                                                                | 0.980  |
+| expert            | 10    | 0.500 / 0.545 / 0.617 / 0.634 / 0.549 / 0.441 / 0.150 / 0.354 / 0.921 / 0.490           | 0.524  |
+| data-investigation| 5     | 0.256 / 0.325 / 0.743 / 0.735 / 0.632                                                   | 0.538  |
+| **overall**       | **33**|                                                                                          | **0.774** |
+
+The 5 data-investigation tasks score 0.26-0.74 because the heuristic
+has NO entries for them - the buggy query is submitted verbatim, and
+the grader reports the partial overlap between buggy and correct
+result sets. `data_01_case_mismatch` scores the lowest at 0.256
+because the lowercase-only country filter catches just 7 of 69 users,
+leaving most of the result set wrong. `data_03_zero_vs_null` and
+`data_04_negative_id` score higher (0.74 / 0.73) because the
+pollution is small (4-1 extra rows on large outputs).
+
+A real LLM agent using the `diagnostic` action on these tasks should
+substantially beat these numbers. An LLM that skips diagnostic and
+submits the obvious "correct" fix without checking the data cannot
+improve on the heuristic - because there IS no obvious fix.
 
 The expert scores span a wide range. `expert_09_cents_vs_dollars`
 lands at **0.150** because the heuristic doesn't know the `amount`

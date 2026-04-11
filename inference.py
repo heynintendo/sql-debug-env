@@ -239,6 +239,11 @@ def env_task_ids() -> List[str]:
         "expert_08_cte_progress_tracking",
         "expert_09_cents_vs_dollars",
         "expert_10_implicit_cross_join",
+        "data_01_case_mismatch",
+        "data_02_trailing_whitespace",
+        "data_03_zero_vs_null",
+        "data_04_negative_id",
+        "data_05_unix_timestamp",
     ]
 
 
@@ -397,6 +402,13 @@ def heuristic_fallback(obs: Dict[str, Any]) -> Dict[str, str]:
     # expert_09 and expert_10 get NO entries - they require exploration
     # and the heuristic shouldn't "solve" them by lookup, landing them in
     # the low-partial-credit region to show real difficulty on the table.
+    #
+    # The 5 data_* tasks also get NO heuristic entries. Their bugs live
+    # in the DATA, not the query, so there's no string pattern to match
+    # against. The heuristic emits the buggy query verbatim and scores
+    # in the low partial-credit region, which is exactly what we want:
+    # the baseline table should show that a lookup-table agent cannot
+    # solve data-investigation tasks at all.
     partial_fixes = [
         ("ORDER BY avg_price ASC", "ORDER BY avg_price DESC"),
         ("INNER JOIN checkouts", "LEFT JOIN checkouts"),

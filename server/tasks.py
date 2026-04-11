@@ -6583,6 +6583,252 @@ TASKS: List[Dict[str, Any]] = [
         "hint": "The per-project totals are way higher than what the individual entries add up to.",
         "max_steps": 12,
     },
+
+    # ==================== DATA-INVESTIGATION (hard / expert) ====================
+    # These 5 tasks have bugs IN THE DATA, not in the SQL. The buggy
+    # query is syntactically and logically correct - it just returns
+    # wrong results because the underlying data has unexpected values.
+    # An agent that reads only the query and the hint cannot diagnose
+    # the bug. It MUST use the ``diagnostic`` action to inspect the
+    # data and find the inconsistency.
+    {
+        # data_01_case_mismatch: users.country has mixed case
+        # ('USA', 'usa', 'Usa'). The query filters for lowercase 'usa'
+        # which only matches a few users. Agent must SELECT DISTINCT
+        # country to find the inconsistency.
+        "task_id": "data_01_case_mismatch",
+        "difficulty": "hard",
+        "schema_sql": ECOMMERCE_SCHEMA + """
+-- Data mutation: inject case-inconsistent country values
+UPDATE users SET country = 'usa' WHERE user_id IN (1, 5, 7, 15, 20, 26, 31, 44);
+UPDATE users SET country = 'Usa' WHERE user_id IN (3, 11, 22, 38);
+""",
+        "buggy_query": (
+            "SELECT u.username, COUNT(*) as purchase_count "
+            "FROM users u "
+            "JOIN purchases p ON u.user_id = p.user_id "
+            "WHERE u.country = 'usa' "
+            "GROUP BY u.username "
+            "ORDER BY u.username;"
+        ),
+        "correct_query": (
+            "SELECT u.username, COUNT(*) as purchase_count "
+            "FROM users u "
+            "JOIN purchases p ON u.user_id = p.user_id "
+            "WHERE LOWER(u.country) = 'usa' "
+            "GROUP BY u.username "
+            "ORDER BY u.username;"
+        ),
+        "hint": "The output is missing some users you know should be there.",
+        "max_steps": 10,
+    },
+    {
+        # data_02_trailing_whitespace: doctors.specialty has trailing
+        # spaces on some cardiology entries. Exact-match WHERE misses
+        # them. Agent needs SELECT specialty, LENGTH(specialty) or TRIM.
+        "task_id": "data_02_trailing_whitespace",
+        "difficulty": "hard",
+        "schema_sql": HOSPITAL_SCHEMA + """
+-- Data mutation: add trailing spaces to some cardiology specialties
+UPDATE doctors SET specialty = 'Cardiology ' WHERE doctor_id IN (1, 5);
+UPDATE doctors SET specialty = 'Cardiology  ' WHERE doctor_id = 9;
+""",
+        "buggy_query": (
+            "SELECT p.name, d.name as doctor_name "
+            "FROM patients p "
+            "JOIN treatments t ON p.patient_id = t.patient_id "
+            "JOIN doctors d ON d.doctor_id = t.doctor_id "
+            "WHERE d.specialty = 'Cardiology' "
+            "ORDER BY p.name, d.name;"
+        ),
+        "correct_query": (
+            "SELECT p.name, d.name as doctor_name "
+            "FROM patients p "
+            "JOIN treatments t ON p.patient_id = t.patient_id "
+            "JOIN doctors d ON d.doctor_id = t.doctor_id "
+            "WHERE TRIM(d.specialty) = 'Cardiology' "
+            "ORDER BY p.name, d.name;"
+        ),
+        "hint": "Some treatments by cardiologists aren't showing up.",
+        "max_steps": 10,
+    },
+    {
+        # data_03_zero_vs_null: some time_entries rows have hours = 0.0
+        # (cancelled work). Members whose only entries are zero-hour
+        # shouldn't appear in a "who did real work" report, but the
+        # buggy query uses HAVING COUNT(*) > 0 instead of SUM(hours) > 0,
+        # so they pass. Agent must run GROUP BY hours to find zeros.
+        "task_id": "data_03_zero_vs_null",
+        "difficulty": "expert",
+        "schema_sql": PROJECTS_SCHEMA + """
+-- Data mutation: four members have ONLY cancelled (zero-hour) entries
+DELETE FROM time_entries WHERE member_id IN (4, 10, 25, 37);
+INSERT INTO time_entries (entry_id, member_id, project_id, work_date, hours, description, billable) VALUES
+    (2001, 4,  1, '2024-02-01', 0.0, 'Cancelled - task reassigned', 0),
+    (2002, 4,  2, '2024-02-03', 0.0, 'Cancelled - scope change',    0),
+    (2003, 4,  3, '2024-02-05', 0.0, 'Cancelled - holiday',         0),
+    (2004, 10, 1, '2024-01-15', 0.0, 'Cancelled - sick day',        0),
+    (2005, 10, 2, '2024-01-20', 0.0, 'Cancelled - reassigned',      0),
+    (2006, 10, 5, '2024-02-01', 0.0, 'Cancelled',                   0),
+    (2007, 25, 3, '2024-03-01', 0.0, 'Cancelled',                   0),
+    (2008, 25, 4, '2024-03-05', 0.0, 'Cancelled',                   0),
+    (2009, 25, 6, '2024-03-10', 0.0, 'Cancelled',                   0),
+    (2010, 37, 1, '2024-02-20', 0.0, 'Cancelled',                   0),
+    (2011, 37, 2, '2024-02-22', 0.0, 'Cancelled',                   0),
+    (2012, 37, 3, '2024-02-24', 0.0, 'Cancelled',                   0);
+""",
+        "buggy_query": (
+            "SELECT m.name, COALESCE(SUM(t.hours), 0) as total "
+            "FROM team_members m "
+            "LEFT JOIN time_entries t ON m.member_id = t.member_id "
+            "GROUP BY m.member_id, m.name "
+            "HAVING COUNT(*) > 0 "
+            "ORDER BY m.name;"
+        ),
+        "correct_query": (
+            "SELECT m.name, SUM(t.hours) as total "
+            "FROM team_members m "
+            "LEFT JOIN time_entries t ON m.member_id = t.member_id "
+            "GROUP BY m.member_id, m.name "
+            "HAVING SUM(t.hours) > 0 "
+            "ORDER BY m.name;"
+        ),
+        "hint": "A few team members show up with very small hour totals that don't seem right.",
+        "max_steps": 12,
+    },
+    {
+        # data_04_negative_id: a SYSTEM user with user_id = -1 is used
+        # as a placeholder for anonymous purchases. It has 60 purchases
+        # linked to it and tops the "most orders per user" list, but
+        # it isn't a real customer. Agent must inspect user_id values.
+        "task_id": "data_04_negative_id",
+        "difficulty": "expert",
+        "schema_sql": ECOMMERCE_SCHEMA + """
+-- Data mutation: add a SYSTEM placeholder user with user_id = -1
+-- and link 60 anonymous purchases to it. Agent must find it by
+-- looking at user_id values (e.g. SELECT user_id, username FROM users ORDER BY user_id LIMIT 5).
+INSERT INTO users (user_id, username, email, signup_date, country, timezone) VALUES
+    (-1, 'SYSTEM', NULL, '2023-01-01', 'USA', 'UTC');
+INSERT INTO purchases (purchase_id, session_id, user_id, product_name, amount, currency, purchase_time, refunded) VALUES
+    (10001,1,-1,'Widget',1999,'USD','2024-01-05 10:00',0),
+    (10002,2,-1,'Widget',1999,'USD','2024-01-05 10:05',0),
+    (10003,3,-1,'Gadget',4999,'USD','2024-01-06 11:00',0),
+    (10004,4,-1,'Gadget',4999,'USD','2024-01-06 11:05',0),
+    (10005,5,-1,'License',19900,'USD','2024-01-07 12:00',0),
+    (10006,6,-1,'License',19900,'USD','2024-01-07 12:05',0),
+    (10007,7,-1,'Support',9900,'USD','2024-01-08 13:00',0),
+    (10008,8,-1,'Training',14900,'USD','2024-01-09 14:00',0),
+    (10009,9,-1,'Widget',1999,'USD','2024-01-10 15:00',0),
+    (10010,10,-1,'Gadget',4999,'USD','2024-01-10 15:30',0),
+    (10011,11,-1,'Widget',1999,'USD','2024-01-11 10:00',0),
+    (10012,12,-1,'Gadget',4999,'USD','2024-01-12 11:00',0),
+    (10013,13,-1,'License',19900,'USD','2024-01-13 12:00',0),
+    (10014,14,-1,'Support',9900,'USD','2024-01-14 13:00',0),
+    (10015,15,-1,'Training',14900,'USD','2024-01-15 14:00',0),
+    (10016,16,-1,'Widget',1999,'USD','2024-01-16 10:00',0),
+    (10017,17,-1,'Gadget',4999,'USD','2024-01-17 11:00',0),
+    (10018,18,-1,'License',19900,'USD','2024-01-18 12:00',0),
+    (10019,19,-1,'Support',9900,'USD','2024-01-19 13:00',0),
+    (10020,20,-1,'Training',14900,'USD','2024-01-20 14:00',0),
+    (10021,21,-1,'Widget',1999,'USD','2024-02-01 10:00',0),
+    (10022,22,-1,'Gadget',4999,'USD','2024-02-01 11:00',0),
+    (10023,23,-1,'License',19900,'USD','2024-02-02 12:00',0),
+    (10024,24,-1,'Support',9900,'USD','2024-02-02 13:00',0),
+    (10025,25,-1,'Training',14900,'USD','2024-02-03 14:00',0),
+    (10026,26,-1,'Widget',1999,'USD','2024-02-04 10:00',0),
+    (10027,27,-1,'Gadget',4999,'USD','2024-02-05 11:00',0),
+    (10028,28,-1,'License',19900,'USD','2024-02-06 12:00',0),
+    (10029,29,-1,'Support',9900,'USD','2024-02-07 13:00',0),
+    (10030,30,-1,'Training',14900,'USD','2024-02-08 14:00',0),
+    (10031,31,-1,'Widget',1999,'USD','2024-02-09 10:00',0),
+    (10032,32,-1,'Gadget',4999,'USD','2024-02-10 11:00',0),
+    (10033,33,-1,'License',19900,'USD','2024-02-11 12:00',0),
+    (10034,34,-1,'Support',9900,'USD','2024-02-12 13:00',0),
+    (10035,35,-1,'Training',14900,'USD','2024-02-13 14:00',0),
+    (10036,36,-1,'Widget',1999,'USD','2024-02-14 10:00',0),
+    (10037,37,-1,'Gadget',4999,'USD','2024-02-15 11:00',0),
+    (10038,38,-1,'License',19900,'USD','2024-02-16 12:00',0),
+    (10039,39,-1,'Support',9900,'USD','2024-02-17 13:00',0),
+    (10040,40,-1,'Training',14900,'USD','2024-02-18 14:00',0),
+    (10041,41,-1,'Widget',1999,'USD','2024-02-19 10:00',0),
+    (10042,42,-1,'Gadget',4999,'USD','2024-02-20 11:00',0),
+    (10043,43,-1,'License',19900,'USD','2024-02-21 12:00',0),
+    (10044,44,-1,'Support',9900,'USD','2024-02-22 13:00',0),
+    (10045,45,-1,'Training',14900,'USD','2024-02-23 14:00',0),
+    (10046,46,-1,'Widget',1999,'USD','2024-02-24 10:00',0),
+    (10047,47,-1,'Gadget',4999,'USD','2024-02-25 11:00',0),
+    (10048,48,-1,'License',19900,'USD','2024-02-26 12:00',0),
+    (10049,49,-1,'Support',9900,'USD','2024-02-27 13:00',0),
+    (10050,50,-1,'Training',14900,'USD','2024-02-28 14:00',0),
+    (10051,51,-1,'Widget',1999,'USD','2024-03-01 10:00',0),
+    (10052,52,-1,'Gadget',4999,'USD','2024-03-02 11:00',0),
+    (10053,53,-1,'License',19900,'USD','2024-03-03 12:00',0),
+    (10054,54,-1,'Support',9900,'USD','2024-03-04 13:00',0),
+    (10055,55,-1,'Training',14900,'USD','2024-03-05 14:00',0),
+    (10056,56,-1,'Widget',1999,'USD','2024-03-06 10:00',0),
+    (10057,57,-1,'Gadget',4999,'USD','2024-03-07 11:00',0),
+    (10058,58,-1,'License',19900,'USD','2024-03-08 12:00',0),
+    (10059,59,-1,'Support',9900,'USD','2024-03-09 13:00',0),
+    (10060,60,-1,'Training',14900,'USD','2024-03-10 14:00',0);
+""",
+        "buggy_query": (
+            "SELECT u.username, COUNT(p.purchase_id) as orders "
+            "FROM users u "
+            "LEFT JOIN purchases p ON u.user_id = p.user_id "
+            "GROUP BY u.user_id, u.username "
+            "ORDER BY orders DESC, u.username;"
+        ),
+        "correct_query": (
+            "SELECT u.username, COUNT(p.purchase_id) as orders "
+            "FROM users u "
+            "LEFT JOIN purchases p ON u.user_id = p.user_id "
+            "WHERE u.user_id > 0 "
+            "GROUP BY u.user_id, u.username "
+            "ORDER BY orders DESC, u.username;"
+        ),
+        "hint": "The top buyer doesn't look like a real customer.",
+        "max_steps": 12,
+    },
+    {
+        # data_05_unix_timestamp: some purchase_time values are stored
+        # as unix timestamps (strings of digits) instead of ISO strings.
+        # Lexicographic string comparison silently excludes them from
+        # date-range queries. Agent must inspect purchase_time values
+        # to discover the mixed format.
+        "task_id": "data_05_unix_timestamp",
+        "difficulty": "expert",
+        "schema_sql": ECOMMERCE_SCHEMA + """
+-- Data mutation: replace ~20 purchase_time values with unix timestamp
+-- strings in January 2024 range (1704067200 to 1706745599). Lexicographic
+-- comparison against '2024-01-01' fails for these because '1' < '2'.
+UPDATE purchases SET purchase_time = '1704153600' WHERE purchase_id IN (1, 3, 5);
+UPDATE purchases SET purchase_time = '1704412800' WHERE purchase_id IN (7, 9, 11);
+UPDATE purchases SET purchase_time = '1704758400' WHERE purchase_id IN (13, 15, 17);
+UPDATE purchases SET purchase_time = '1705017600' WHERE purchase_id IN (19, 21, 23);
+UPDATE purchases SET purchase_time = '1705449600' WHERE purchase_id IN (25, 27, 29);
+UPDATE purchases SET purchase_time = '1705881600' WHERE purchase_id IN (31, 33, 35);
+UPDATE purchases SET purchase_time = '1706313600' WHERE purchase_id IN (37, 39, 41);
+""",
+        "buggy_query": (
+            "SELECT u.username, p.purchase_time, p.product_name "
+            "FROM purchases p "
+            "JOIN users u ON p.user_id = u.user_id "
+            "WHERE p.purchase_time >= '2024-01-01' AND p.purchase_time < '2024-02-01' "
+            "ORDER BY p.purchase_id;"
+        ),
+        "correct_query": (
+            "SELECT u.username, p.purchase_time, p.product_name "
+            "FROM purchases p "
+            "JOIN users u ON p.user_id = u.user_id "
+            "WHERE (p.purchase_time LIKE '2024-01-%') "
+            "   OR (p.purchase_time GLOB '[0-9]*' "
+            "       AND CAST(p.purchase_time AS INTEGER) >= 1704067200 "
+            "       AND CAST(p.purchase_time AS INTEGER) < 1706745600) "
+            "ORDER BY p.purchase_id;"
+        ),
+        "hint": "The query returns some January purchases but seems to be missing quite a few.",
+        "max_steps": 12,
+    },
 ]
 
 
