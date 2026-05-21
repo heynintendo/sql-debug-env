@@ -1,0 +1,14 @@
+name: Keep HF Space awake
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /health
+        run: curl -fsS https://anishkishore-sql-debug-env.hf.space/health > /dev/null
